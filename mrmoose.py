@@ -56,7 +56,7 @@ def SED_fit(settings_file, Parallel=None,fit_method=''):
 
     # read the files with the fit settings
     with open(settings_file, 'rb') as input:
-        fit_struct = yaml.load(input)
+        fit_struct = yaml.load(input, Loader=yaml.SafeLoader)
 
     # some memory and timing tracking
     # h=hpy()
