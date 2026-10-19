@@ -20,6 +20,7 @@ GNU General Public License for more details.
 from . models import *
 from . import mm_utilities as ut
 import scipy.special
+from scipy.optimize import differential_evolution, minimize
 import pathos.multiprocessing as mp
 from tqdm import tqdm
 import emcee,ultranest
@@ -27,11 +28,212 @@ import pickle as pickle
 import os.path
 import logging
 import dill
+import tempfile
+import h5py
 
 #create a logger
 logger = logging.getLogger('mylogger')
 #set logging level
 logger.setLevel(logging.DEBUG)
+
+
+class _RadioHDFBackend(emcee.backends.HDFBackend):
+    """Cache fixed metadata for fresh radio runs; retain every HDF write.
+
+    The radio likelihood returns no blobs. Its shape is fixed by reset, so
+    checking each proposal need not reopen the file for these two properties.
+    Ordinary HDFBackend readers can inspect and resume the resulting file.
+    """
+
+    def reset(self, nwalkers, ndim):
+        super().reset(nwalkers, ndim)
+        self._radio_shape = (nwalkers, ndim)
+
+    @property
+    def shape(self):
+        return self._radio_shape if hasattr(self, '_radio_shape') else super().shape
+
+    def has_blobs(self):
+        return False if hasattr(self, '_radio_shape') else super().has_blobs()
+
+    def _check_blobs(self, blobs):
+        if blobs is not None:
+            raise ValueError('Fast radio sampler does not support blobs')
+
+
+def _compact_sampler_file(filename):
+    """Atomically remove HDF free-space fragmentation after a completed fit.
+
+    HDFBackend opens the filename for each access, so an existing sampler
+    remains usable after replacement. This is never called for reused chains.
+    """
+    before = os.stat(filename)
+    directory = os.path.dirname(os.path.abspath(filename))
+    descriptor, temporary = tempfile.mkstemp(prefix='.mrmoose-compact-', suffix='.h5', dir=directory)
+    os.close(descriptor)
+    try:
+        with h5py.File(filename, 'r') as original, h5py.File(temporary, 'w') as compact:
+            for key, value in original.attrs.items():
+                compact.attrs[key] = value
+            for key in original:
+                original.copy(key, compact)
+        old = emcee.backends.HDFBackend(filename, read_only=True)
+        new = emcee.backends.HDFBackend(temporary, read_only=True)
+        if old.iteration != new.iteration or old.shape != new.shape:
+            raise IOError('Compacted sampler metadata does not match the completed chain')
+        if not np.array_equal(old.accepted, new.accepted):
+            raise IOError('Compacted sampler lost acceptance counters')
+        old_last, new_last = old.get_last_sample(), new.get_last_sample()
+        if (not np.array_equal(old_last.coords, new_last.coords)
+                or not np.array_equal(old_last.log_prob, new_last.log_prob)):
+            raise IOError('Compacted sampler last state does not match')
+        os.chmod(temporary, before.st_mode & 0o777)
+        after_bytes = os.stat(temporary).st_size
+        os.replace(temporary, filename)
+        return {'bytes_before': before.st_size, 'bytes_after': after_bytes}
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+class _RadioLikelihood:
+    """Exact, vectorized filter integration for one opt-in radio component.
+
+    Parameters and stored chains remain in the original model coordinates.
+    The precomputed quadrature uses exactly the generic 2000-point grid and
+    interpolation rule; no monochromatic or analytic-band approximation is
+    introduced. Unsupported model combinations keep the generic code path.
+    """
+
+    def __init__(self, fit_struct, data, filters, models):
+        if len(models) != 1 or models[0]['func'] not in ('sync_law', 'radio_broken_power_law'):
+            raise ValueError('Fast radio likelihood requires one supported radio model')
+        self.model_name = models[0]['func']
+        self.redshift = float(fit_struct['redshift'][0])
+        if self.redshift < 0:
+            raise ValueError('Fast radio likelihood requires a fixed nonnegative redshift')
+        self.minimum = np.asarray(models[0]['min'], dtype=float)
+        self.maximum = np.asarray(models[0]['max'], dtype=float)
+        self.groups = []
+        for points, bandpasses in zip(data, filters):
+            for component in points['component_number']:
+                components = [int(s) for s in str(component).split(',') if s]
+                if components != [0]:
+                    raise ValueError('Fast radio likelihood requires component zero only')
+            frequencies = np.asarray(points['lambda0'], dtype=float)
+            grid = 10**np.linspace(np.log10(frequencies.min()*.01),
+                                   np.log10(frequencies.max()*100), 2000)
+            quadrature = np.empty_like(grid)
+            quadrature[0] = (grid[1]-grid[0])/2
+            quadrature[-1] = (grid[-1]-grid[-2])/2
+            quadrature[1:-1] = (grid[2:]-grid[:-2])/2
+            weights = []
+            for freq, transmission in zip(bandpasses['wav'], bandpasses['trans']):
+                response = np.interp(grid, freq, transmission, left=0., right=0.)
+                weight = quadrature * grid * response
+                if not np.isfinite(weight.sum()) or weight.sum() <= 0:
+                    raise ValueError('Radio filter has no positive response within the model grid')
+                weights.append(weight/weight.sum())
+            weights = np.asarray(weights)
+            used = np.any(weights != 0, axis=0)
+            flux = np.asarray(points['flux'], dtype=float)
+            error = np.asarray(points['flux_error'], dtype=float)
+            if not np.all(np.isfinite(flux)) or not np.all(np.isfinite(error)) or np.any(error <= 0):
+                raise ValueError('Radio fluxes and positive errors must be finite')
+            kind = np.asarray(points['det_type'])
+            if not np.all((kind == 'd') | (kind == 'u')):
+                raise ValueError('Radio data must contain detections or upper limits')
+            # Keep cgs sigma in the model-independent Gaussian integral constant.
+            self.groups.append((np.log10(grid[used]), weights[:, used],
+                                flux*1e26, error*1e26, kind == 'd',
+                                .5*np.log(2*np.pi)+np.log(error)))
+
+    def __call__(self, parameters):
+        values = np.asarray(parameters, dtype=float)
+        scalar = values.ndim == 1
+        values = np.atleast_2d(values)
+        valid = np.all(np.isfinite(values) & (values > self.minimum) & (values < self.maximum), axis=1)
+        result = np.full(len(values), -np.inf)
+        if np.any(valid):
+            theta = values[valid]
+            objective = np.zeros(len(theta))
+            log_one_plus_z = np.log10(1+self.redshift)
+            with np.errstate(over='ignore', invalid='ignore'):
+                for logfreq, weights, flux, error, detected, constant in self.groups:
+                    if self.model_name == 'sync_law':
+                        exponent = (theta[:, 0, None] + 26 + log_one_plus_z
+                                    + theta[:, 1, None]*(logfreq-log_one_plus_z))
+                    else:
+                        delta = logfreq[None, :] + log_one_plus_z - theta[:, 1, None]
+                        slope = np.where(delta <= 0, theta[:, 2, None], theta[:, 3, None])
+                        exponent = theta[:, 0, None] + 26 + delta*slope
+                    model = np.einsum('ij,kj->ik', 10**exponent, weights, optimize=False)
+                    objective += np.sum(((flux[detected]-model[:, detected])/error[detected])**2, axis=1)
+                    z = (flux[~detected]-model[:, ~detected])/error[~detected]
+                    objective -= 2*np.sum(constant[~detected]+scipy.special.log_ndtr(z), axis=1)
+            result[valid] = np.where(np.isfinite(objective), -objective, -np.inf)
+        return float(result[0]) if scalar else result
+
+
+def _radio_initial_positions(likelihood, fit_struct):
+    """Find a deterministic radio maximum, then seed a finite dispersed ball."""
+    seed = fit_struct.get('random_seed')
+    random = np.random.default_rng(seed)
+    lower, upper = likelihood.minimum, likelihood.maximum
+    log_z = np.log10(1+likelihood.redshift)
+    if likelihood.model_name == 'sync_law':
+        # A pivot at observed 1 GHz removes the large raw-Hz normalization/slope
+        # correlation during optimization; the likelihood enforces native priors.
+        bounds = [(-12., 15.), (lower[1], upper[1])]
+
+        def native(value):
+            value = np.asarray(value).copy()
+            value[..., 0] -= 26 + log_z + value[..., 1]*(9-log_z)
+            return value
+    else:
+        bounds = [(lower[0]+26, upper[0]+26),
+                  (lower[1]-9-log_z, upper[1]-9-log_z),
+                  (lower[2], upper[2]), (lower[3], upper[3])]
+
+        def native(value):
+            value = np.asarray(value).copy()
+            value[..., 0] -= 26
+            value[..., 1] += 9 + log_z
+            return value
+
+    def objective(value):
+        return -likelihood(native(value))
+
+    optimum = differential_evolution(
+        lambda values: -likelihood(native(values.T)), bounds,
+        seed=seed, popsize=12, maxiter=int(fit_struct.get('radio_optimizer_iterations', 350)),
+        tol=1e-8, polish=False, vectorized=True, updating='deferred')
+    polished = minimize(objective, optimum.x, method='Nelder-Mead', bounds=bounds,
+                        options={'maxiter': 2500, 'xatol': 1e-9, 'fatol': 1e-8})
+    if polished.fun < optimum.fun:
+        optimum = polished
+    center = native(optimum.x)
+    if not np.isfinite(likelihood(center)):
+        raise ValueError('Radio optimizer could not find a finite initialization')
+    fit_struct['radio_initialization'] = {
+        'method': 'differential_evolution_then_simplex', 'seed': seed,
+        'optimizer_success': bool(optimum.success),
+        'parameters': center.tolist(), 'lnL': float(likelihood(center)),
+        'note': 'Initialization does not establish posterior convergence or exclude other modes.',
+    }
+    nwalkers = int(fit_struct['nwalkers'])
+    positions = []
+    for walker in range(nwalkers):
+        # Include wider starting walkers to reduce reliance on one tiny ball.
+        spread = .02 if walker % 5 == 0 else .001
+        for attempt in range(10000):
+            proposal = center + spread*(upper-lower)*random.normal(size=len(center))
+            if np.isfinite(likelihood(proposal)):
+                positions.append(proposal)
+                break
+        else:
+            raise ValueError('Could not initialize finite radio walkers within native priors')
+    return np.asarray(positions)
 
 def calc_chi2(obs_flux, error, model):
     """
@@ -57,8 +259,19 @@ def calc_chi2_mod(upper_lim, rms, model):
     :param model: Flux from the model
     :return: The modified chi2
     """
-    # TODO review this formula to clean the input parameters
-    return -2.*np.sum(np.log((np.pi/2.)**0.5*rms*(1.+scipy.special.erf(((rms-model)/((2**0.5)*rms))))))
+    upper_lim = np.asarray(upper_lim)
+    rms = np.asarray(rms)
+    model = np.asarray(model)
+
+    if np.any(rms <= 0):
+        raise ValueError("Upper-limit RMS values must be strictly positive")
+
+    # Sawicki (2012): integrate each Gaussian likelihood from -infinity
+    # to the reported upper limit. log_ndtr evaluates log(Phi(z))
+    # robustly even when the model lies many sigma above the limit.
+    z = (upper_lim - model) / rms
+    log_integral = 0.5 * np.log(2. * np.pi) + np.log(rms) + scipy.special.log_ndtr(z)
+    return -2. * np.sum(log_integral)
 
 
 
@@ -254,7 +467,25 @@ def fit_source(fit_struct, data_struct, filter_struct, model_struct, Parallel=0)
     #     #print last_index
     #     #pos = [chain.chain[i][last_index] for i in range(fit_struct['nwalkers'])]
     # else:
-    pos = [flat_param + 1e-4 * coef_param * np.random.randn(ndim) for i in range(fit_struct['nwalkers'])]
+    radio_likelihood = None
+    radio_supported = (len(model_struct) == 1 and model_struct[0]['func'] in
+                       ('sync_law', 'radio_broken_power_law')
+                       and fit_struct['redshift'][0] >= 0)
+    if fit_struct.get('radio_fast', False) and radio_supported:
+        radio_likelihood = _RadioLikelihood(fit_struct, data_struct, filter_struct, model_struct)
+    fit_struct['radio_fast_used'] = radio_likelihood is not None
+    if fit_struct.get('radio_initialize', False) and radio_likelihood is not None:
+        pos = _radio_initial_positions(radio_likelihood, fit_struct)
+    else:
+        rng = np.random.default_rng(fit_struct.get('random_seed'))
+        pos = [flat_param + 1e-4 * coef_param * rng.normal(size=ndim)
+               for i in range(fit_struct['nwalkers'])]
+    if fit_struct['fit_method'] == 'emcee':
+        initial_probability = (radio_likelihood(pos) if radio_likelihood is not None else
+                               np.array([lnprob(np.asarray(p), fit_struct, data_struct,
+                                                filter_struct, model_struct, detection_mask) for p in pos]))
+        if not np.all(np.isfinite(initial_probability)):
+            raise ValueError('Initial walkers have non-finite log probabilities; fix inputs or initialization')
     print("initialise walker positions")
     last_index = 0
 
@@ -269,22 +500,28 @@ def fit_source(fit_struct, data_struct, filter_struct, model_struct, Parallel=0)
     if fit_struct['fit_method']=='emcee': 
     # create the backend for emcee
         filename = fit_struct['sampler_file']
-        backend = emcee.backends.HDFBackend(filename)
+        backend_class = _RadioHDFBackend if radio_likelihood is not None else emcee.backends.HDFBackend
+        backend = backend_class(filename)
         # if restart:
         #     print('continuing last run')
         # else:
         #     backend.reset(fit_struct['nwalkers'],ndim)
         backend.reset(fit_struct['nwalkers'],ndim)
     
-        if Parallel == 0:
+        if radio_likelihood is not None:
+            sampler = emcee.EnsembleSampler(fit_struct['nwalkers'], ndim,
+                                            radio_likelihood, vectorize=True, backend=backend)
+        elif Parallel == 0:
             sampler = emcee.EnsembleSampler(fit_struct['nwalkers'], ndim, lnprob,
                                             args=(fit_struct, data_struct, filter_struct, model_struct, detection_mask), backend=backend)
         else:
             # multi-processing (pool created via pathos, allow to pickle the sampler)
             tmp_pool = mp.ProcessingPool(Parallel)
             sampler = emcee.EnsembleSampler(fit_struct['nwalkers'], ndim, lnprob,
-                                            args=(data_struct, filter_struct, model_struct, detection_mask, fit_struct['redshift']),
+                                            args=(fit_struct, data_struct, filter_struct, model_struct, detection_mask),
                                             pool=tmp_pool, backend=backend)
+        if fit_struct.get('random_seed') is not None:
+            sampler.random_state = np.random.RandomState(int(fit_struct['random_seed'])).get_state()
             
     # progress bar (work for multiprocess or single process)
 #    for sample in sampler.sample(pos,iterations=fit_source['nsteps'],progress=True):
@@ -293,6 +530,8 @@ def fit_source(fit_struct, data_struct, filter_struct, model_struct, Parallel=0)
             for i, result in enumerate(sampler.sample(pos, iterations=fit_struct['nsteps'])):
                 pbar.update()
             print('HMC done!')
+        if fit_struct.get('compact_sampler', radio_likelihood is not None):
+            fit_struct['sampler_storage'] = _compact_sampler_file(filename)
 
     #pbar = tqdm(total=fit_struct['nsteps'],initial=last_index)
     #print fit_struct['nsteps']-last_index
