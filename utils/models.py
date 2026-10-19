@@ -212,6 +212,26 @@ def double_sync_law(nu, param, redshift):
 #    y /= nu teporary hack
     return np.float64(y)
 
+def radio_broken_power_law(nu, param, redshift):
+    """
+    Generic continuous broken radio power law.
+
+    Parameters:
+    p[0]: log10 flux density at the observed-frame break, in cgs flux units
+    p[1]: log10 rest-frame break frequency in Hz
+    p[2]: lower-frequency spectral index, S_nu proportional to nu^alpha1
+    p[3]: higher-frequency spectral index, S_nu proportional to nu^alpha2
+
+    Unlike double_sync_law, this does not impose a preferred steepening
+    direction, so it can fit both peaked and upturning radio spectra.
+    """
+    n, nu_break, a1, a2 = param
+    nu = np.asarray(nu, dtype=float)
+    nu_break_obs = 10**nu_break / (1. + redshift)
+    ratio = nu / nu_break_obs
+    y = np.where(ratio <= 1., ratio**a1, ratio**a2)
+    return np.float64((10**n) * y)
+
 def double_power_law(nu,a,redshift,s=1.):
     norm,nu_t,a1,a2=a
     y = norm*nu**a1*(1.+(nu/(10**nu_t))**(np.abs(a1-a2)*s))**(np.sign(a2-a1)/s)
